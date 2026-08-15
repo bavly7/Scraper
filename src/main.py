@@ -1,19 +1,25 @@
+import os
 import time
 import json
 import requests
+import re
 from pathlib import Path
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from typing import Optional
+from pydantic import BaseModel, HttpUrl, Field, ValidationError
 
 # Base configuration
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
-
-# Sub-directory for book pages to keep things organized
 BOOK_CACHE_DIR = CACHE_DIR / "books"
 BOOK_CACHE_DIR.mkdir(exist_ok=True)
+
+# Output directory for Stage 4
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Polite robot headers
 HEADERS = {
@@ -23,11 +29,22 @@ REQUEST_TIMEOUT_SECONDS = 5
 DELAY_SECONDS = 0.5
 
 
+# --- PYDANTIC SCHEMA (Stage 4) ---
+class BookRecord(BaseModel):
+    title: str
+    product_url: str = Field(pattern=r"^https://") # URL must start with https://
+    price_text: str
+    price_gbp: float
+    availability_text: Optional[str] = None
+    rating_text: Optional[str] = None
+    description: Optional[str] = None
+    source_page: str
+    fetched_at: str
+
+
 def fetch_and_cache(url: str, cache_path: Path) -> tuple[str, bool]:
-    """Fetches a URL with caching and polite rules."""
     if cache_path.exists():
-        content = cache_path.read_text(encoding="utf-8")
-        return content, True
+        return cache_path.read_text(encoding="utf-8"), True
 
     try:
         response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -44,7 +61,6 @@ def fetch_and_cache(url: str, cache_path: Path) -> tuple[str, bool]:
 
 
 def parse_catalogue_page(html: str, page_url: str):
-    """Extracts book URLs and the 'next' page URL."""
     soup = BeautifulSoup(html, "html.parser")
     book_links = []
     
@@ -63,32 +79,25 @@ def parse_catalogue_page(html: str, page_url: str):
 
 
 def parse_book_page(html: str, product_url: str, source_page: str) -> dict:
-    """Extracts the 8 raw fields from a single book page."""
     soup = BeautifulSoup(html, "html.parser")
-    # Aiming selectors at the product area, not the whole document
     product_main = soup.select_one("article.product_page")
     
-    # 1. Title
     title_tag = product_main.select_one("h1")
     title = title_tag.text if title_tag else None
     
-    # 2. Price
     price_tag = product_main.select_one("p.price_color")
     price_text = price_tag.text if price_tag else None
     
-    # 3. Availability
     availability_tag = product_main.select_one("p.instock.availability")
     availability_text = availability_tag.text.strip() if availability_tag else None
     
-    # 4. Rating (Extracting class name like 'Three')
     rating_tag = product_main.select_one("p.star-rating")
     rating_text = None
     if rating_tag:
         classes = rating_tag.attrs.get("class", [])
         if len(classes) > 1:
-            rating_text = classes[1]  # e.g., 'Three', 'One'
+            rating_text = classes[1]
             
-    # 5. Description (Handling missing descriptions with None/null)
     desc_header = product_main.select_one("#product_description")
     description = None
     if desc_header:
@@ -109,17 +118,27 @@ def parse_book_page(html: str, product_url: str, source_page: str) -> dict:
 
 
 def get_safe_filename(url: str) -> str:
-    """Converts a URL into a safe filename for caching."""
     return url.replace("https://books.toscrape.com/catalogue/", "").replace("/", "_")
 
 
-def run_stage_3():
-    print("--- Running Stage 2 & 3 ---")
+def extract_price_gbp(price_text: str) -> float:
+    """Extracts numeric value from a price string like '£51.77'."""
+    if not price_text:
+        return 0.0
+    # Search for numbers and a dot
+    match = re.search(r'[\d\.]+', price_text)
+    if match:
+        return float(match.group())
+    return 0.0
+
+
+def run_pipeline():
+    print("--- Starting Pipeline ---")
     current_url = START_URL
     catalogue_pages_visited = 0
     discovered_records = []
     
-    # --- STAGE 2: Discover Links ---
+    # --- STAGE 2: Discover ---
     while current_url and catalogue_pages_visited < 3:
         page_num = catalogue_pages_visited + 1
         cache_path = CACHE_DIR / f"catalogue-page-{page_num}.html"
@@ -129,21 +148,17 @@ def run_stage_3():
             time.sleep(DELAY_SECONDS)
             
         links, next_url = parse_catalogue_page(html, current_url)
-        
-        # We need to save the source_page along with the URL for Stage 3
         for link in links:
             discovered_records.append({"book_url": link, "source_page": current_url})
             
         catalogue_pages_visited += 1
         current_url = next_url
         
-    # Remove duplicates based on URL
     unique_records = {record["book_url"]: record for record in discovered_records}.values()
     
-    # --- STAGE 3: Extract Book Details ---
+    # --- STAGE 3: Extract ---
     raw_books = []
-    
-    print(f"Starting extraction for {len(unique_records)} books...")
+    print(f"Extracting {len(unique_records)} books...")
     for idx, record in enumerate(unique_records):
         book_url = record["book_url"]
         source_page = record["source_page"]
@@ -157,17 +172,41 @@ def run_stage_3():
             
         book_data = parse_book_page(html, book_url, source_page)
         raw_books.append(book_data)
-        
-        # Simple progress indicator
-        if (idx + 1) % 10 == 0:
-            print(f"Processed {idx + 1} / {len(unique_records)} books...")
 
-    # Checkpoint verification
-    print("\n--- CHECKPOINT RESULTS ---")
-    # Print the very first complete raw record as JSON
-    print(json.dumps(raw_books[0], indent=2, ensure_ascii=False))
-    # Print the exact summary format requested
-    print(f"\ndetail_pages={len(raw_books)}")
+    # --- STAGE 4: Clean, Validate, Store ---
+    valid_books = {}
+    errors = []
+    
+    for raw in raw_books:
+        # 1. Normalize price
+        price_text = raw.get("price_text")
+        raw["price_gbp"] = extract_price_gbp(price_text)
+        
+        # 2. Schema Validation
+        try:
+            validated_book = BookRecord(**raw)
+            # Use URL as dictionary key to enforce Idempotency (prevent duplicates)
+            valid_books[validated_book.product_url] = validated_book.model_dump()
+        except ValidationError as e:
+            errors.append({
+                "url": raw.get("product_url"),
+                "reason": str(e)
+            })
+            
+    # 3. Save to output/books.json
+    books_file_path = OUTPUT_DIR / "books.json"
+    with open(books_file_path, "w", encoding="utf-8") as f:
+        json.dump(list(valid_books.values()), f, indent=2, ensure_ascii=False)
+        
+    # 4. Save to output/errors.json
+    errors_file_path = OUTPUT_DIR / "errors.json"
+    with open(errors_file_path, "w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2, ensure_ascii=False)
+
+    # Checkpoint output
+    print("\n--- CHECKPOINT RESULTS (STAGE 4) ---")
+    print(f"Valid records in books.json: {len(valid_books)}")
+    print(f"Invalid records in errors.json: {len(errors)}")
 
 if __name__ == "__main__":
-    run_stage_3()
+    run_pipeline()
